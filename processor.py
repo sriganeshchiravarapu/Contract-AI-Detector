@@ -1,54 +1,63 @@
 import google.generativeai as genai
 import streamlit as st
-import time
+import json
+import re
+from PyPDF2 import PdfReader
 
-# 1. Configuration
-# It is best practice to pull the key from st.secrets for deployment
-api_key = st.secrets["GEMINI_API_KEY"]
+# 1. Initialize Gemma 4 31B
+# Ensure your Streamlit secrets has GEMINI_API_KEY
+api_key = st.secrets.get("GEMINI_API_KEY")
 genai.configure(api_key=api_key)
 
-# 2. Initialize Gemma 4 31B
-# This model has a higher quota than the experimental 2.5 series
-MODEL_NAME = 'gemma-4-31b-it'
+# The production identifier for Gemma 4 31B
+MODEL_NAME = 'models/gemma-4-31b-it'
 model = genai.GenerativeModel(MODEL_NAME)
 
-def process_contract(text):
-    """
-    Analyzes legal text for risks using Gemma 4.
-    Includes a retry mechanism for rate-limit stability.
-    """
-    prompt = f"""
-    You are a professional legal risk assessor. 
-    Analyze the following contract text for:
-    1. High-risk clauses (Liability, Termination, Payments).
-    2. Missing protections.
-    3. Potential financial gaps.
+def extract_text(uploaded_file):
+    """Extracts text from PDF or TXT files."""
+    if uploaded_file.type == "application/pdf":
+        reader = PdfReader(uploaded_file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text()
+        return text
+    else:
+        return str(uploaded_file.read(), "utf-8")
 
-    Provide a clear, structured summary of findings.
+def analyze_contract(text, user_query, api_key):
+    """
+    Uses Gemma 4 31B to perform a deep legal analysis.
+    Returns a structured dictionary for the dashboard.
+    """
     
-    CONTRACT TEXT:
-    {text}
-    """
+    # SYSTEM PROMPT: Forces Gemma to output clean JSON
+    system_instruction = (
+        "You are a Senior Legal AI. Analyze the contract text and output ONLY a valid JSON object. "
+        "Do not include conversational filler, markdown code blocks (like ```json), or notes. "
+        "The JSON must have these exact keys: "
+        "'risk_level' (High/Medium/Low), 'party_1', 'party_2', 'payment_terms', "
+        "'termination_clause', 'liability_clause', 'risk_summary', 'entity_count', 'clauses_found'."
+    )
 
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            if "429" in str(e) and attempt < max_retries - 1:
-                # Wait 5 seconds before retrying if rate limited
-                time.sleep(5)
-                continue
-            return f"Analysis Error: {str(e)}"
+    prompt = f"{system_instruction}\n\nUser Analysis Goal: {user_query}\n\nContract Text:\n{text[:10000]}" # Limit to 10k chars for speed
 
-def extract_entities(text):
-    """
-    Helper function to get structured data for your dashboard's JSON view.
-    """
-    prompt = f"Extract the 'Effective Date', 'Parties Involved', and 'Contract Value' from this text as JSON: {text}"
     try:
         response = model.generate_content(prompt)
-        return response.text
-    except:
-        return "{'error': 'Entity extraction failed'}"
+        
+        # Clean the response string in case Gemma adds markdown backticks
+        clean_json = response.text.replace('```json', '').replace('```', '').strip()
+        
+        # Parse into a Python dictionary
+        analysis_dict = json.loads(clean_json)
+        return analysis_dict
+        
+    except json.JSONDecodeError:
+        # Fallback if the AI fails to output valid JSON
+        return {
+            "risk_level": "Error",
+            "risk_summary": "Gemma failed to generate a structured JSON report. Please try again.",
+            "party_1": "Unknown", "party_2": "Unknown",
+            "payment_terms": "Error", "termination_clause": "Error", "liability_clause": "Error"
+        }
+    except Exception as e:
+        raise Exception(f"Gemma 4 Error: {str(e)}")
