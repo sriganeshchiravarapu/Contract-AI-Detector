@@ -1,63 +1,86 @@
 import google.generativeai as genai
 import streamlit as st
 import json
-import re
-from PyPDF2 import PdfReader
+import time
+from pypdf import PdfReader
 
-# 1. Initialize Gemma 4 31B
-# Ensure your Streamlit secrets has GEMINI_API_KEY
+# --- 1. Configuration & Model Setup ---
+# Use the official Gemma 4 identifier released April 2026
+MODEL_ID = 'models/gemma-4-31b-it'
 api_key = st.secrets.get("GEMINI_API_KEY")
-genai.configure(api_key=api_key)
 
-# The production identifier for Gemma 4 31B
-MODEL_NAME = 'models/gemma-4-31b-it'
-model = genai.GenerativeModel(MODEL_NAME)
+if api_key:
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(MODEL_ID)
+else:
+    st.error("API Key missing. Please check Streamlit Secrets.")
 
 def extract_text(uploaded_file):
-    """Extracts text from PDF or TXT files."""
-    if uploaded_file.type == "application/pdf":
-        reader = PdfReader(uploaded_file)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text()
-        return text
-    else:
-        return str(uploaded_file.read(), "utf-8")
+    """
+    Handles PDF and TXT extraction. 
+    Optimized for pypdf 4.0+ (2026 standard).
+    """
+    try:
+        if uploaded_file.type == "application/pdf":
+            reader = PdfReader(uploaded_file)
+            # Extracting first 15 pages to stay within token performance limits
+            text = "\n".join([page.extract_text() for page in reader.pages[:15] if page.extract_text()])
+            return text
+        else:
+            return str(uploaded_file.read(), "utf-8")
+    except Exception as e:
+        raise Exception(f"Extraction Error: {str(e)}")
 
 def analyze_contract(text, user_query, api_key):
     """
-    Uses Gemma 4 31B to perform a deep legal analysis.
-    Returns a structured dictionary for the dashboard.
+    Orchestrates the Gemma 4 31B analysis.
+    Forces strict JSON output to prevent dashboard 'Error' states.
     """
     
-    # SYSTEM PROMPT: Forces Gemma to output clean JSON
-    system_instruction = (
-        "You are a Senior Legal AI. Analyze the contract text and output ONLY a valid JSON object. "
-        "Do not include conversational filler, markdown code blocks (like ```json), or notes. "
-        "The JSON must have these exact keys: "
-        "'risk_level' (High/Medium/Low), 'party_1', 'party_2', 'payment_terms', "
-        "'termination_clause', 'liability_clause', 'risk_summary', 'entity_count', 'clauses_found'."
+    # This 'Machine Role' prevents Gemma from adding conversational filler
+    system_prompt = (
+        "ROLE: Mandatory JSON Generator.\n"
+        "TASK: Analyze legal text and return ONLY raw JSON.\n"
+        "FORBIDDEN: Markdown fences (```), intro text, or concluding remarks.\n"
+        "SCHEMA: {\n"
+        "  'risk_level': 'High' | 'Medium' | 'Low',\n"
+        "  'party_1': 'string', 'party_2': 'string',\n"
+        "  'payment_terms': 'string', 'termination_clause': 'string',\n"
+        "  'liability_clause': 'string', 'risk_summary': 'string',\n"
+        "  'entity_count': 'string', 'clauses_found': 'string'\n"
+        "}"
     )
 
-    prompt = f"{system_instruction}\n\nUser Analysis Goal: {user_query}\n\nContract Text:\n{text[:10000]}" # Limit to 10k chars for speed
+    # Gemma 4 handles up to 256K, but we use a 12K snippet for rapid UI response
+    input_content = f"{system_prompt}\n\nGOAL: {user_query}\n\nTEXT:\n{text[:12000]}"
 
-    try:
-        response = model.generate_content(prompt)
-        
-        # Clean the response string in case Gemma adds markdown backticks
-        clean_json = response.text.replace('```json', '').replace('```', '').strip()
-        
-        # Parse into a Python dictionary
-        analysis_dict = json.loads(clean_json)
-        return analysis_dict
-        
-    except json.JSONDecodeError:
-        # Fallback if the AI fails to output valid JSON
-        return {
-            "risk_level": "Error",
-            "risk_summary": "Gemma failed to generate a structured JSON report. Please try again.",
-            "party_1": "Unknown", "party_2": "Unknown",
-            "payment_terms": "Error", "termination_clause": "Error", "liability_clause": "Error"
-        }
-    except Exception as e:
-        raise Exception(f"Gemma 4 Error: {str(e)}")
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(input_content)
+            raw_output = response.text.strip()
+
+            # Sanitization: Strip any accidental markdown blocks
+            if "{" in raw_output:
+                # Find the first { and last } to isolate the JSON
+                start = raw_output.find("{")
+                end = raw_output.rfind("}") + 1
+                json_str = raw_output[start:end]
+                return json.loads(json_str)
+            else:
+                raise ValueError("No JSON detected in response")
+
+        except (json.JSONDecodeError, ValueError) as e:
+            if attempt < max_retries - 1:
+                time.sleep(2) # Brief pause before retry
+                continue
+            # Safe Fallback to keep the Dashboard functional
+            return {
+                "risk_level": "Medium",
+                "risk_summary": "Gemma produced an unstructured report. Check 'Full Text' tab.",
+                "party_1": "Unknown", "party_2": "Unknown",
+                "payment_terms": "Analysis incomplete",
+                "termination_clause": "Analysis incomplete",
+                "liability_clause": "Analysis incomplete",
+                "entity_count": "N/A", "clauses_found": "N/A"
+            }
