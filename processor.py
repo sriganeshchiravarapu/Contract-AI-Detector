@@ -1,48 +1,54 @@
-import pdfplumber
 import google.generativeai as genai
-import json
+import streamlit as st
+import time
 
-def extract_text(uploaded_file):
-    """Reads PDF or TXT files on Windows."""
-    text = ""
-    try:
-        if uploaded_file.name.endswith('.pdf'):
-            with pdfplumber.open(uploaded_file) as pdf:
-                for page in pdf.pages:
-                    text += page.extract_text() + "\n"
-        else:
-            text = uploaded_file.read().decode("utf-8")
-    except Exception as e:
-        return f"Error: {e}"
-    return text.strip()
+# 1. Configuration
+# It is best practice to pull the key from st.secrets for deployment
+api_key = st.secrets["GEMINI_API_KEY"]
+genai.configure(api_key=api_key)
 
-def analyze_contract(text, query, api_key):
-    genai.configure(api_key=api_key)
-    
-    # --- DEBUG STEP: Print available models to your terminal ---
-    print("Listing available models for your API key...")
-    for m in genai.list_models():
-        if 'generateContent' in m.supported_generation_methods:
-            print(f"Found: {m.name}")
-    # -----------------------------------------------------------
+# 2. Initialize Gemma 4 31B
+# This model has a higher quota than the experimental 2.5 series
+MODEL_NAME = 'gemma-4-31b-it'
+model = genai.GenerativeModel(MODEL_NAME)
 
-    # Use the most direct model name
-    # If gemini-1.5-flash fails, the list above will tell us why
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    
-    prompt = f"""
-    Analyze the following contract based on: {query}
-    
-    Return JSON only:
-    {{
-      "party_1": "...", "party_2": "...", "risk_level": "High/Medium/Low",
-      "risk_summary": "...", "payment_terms": "...",
-      "termination_clause": "...", "liability_clause": "..."
-    }}
-
-    Text: {text[:10000]}
+def process_contract(text):
     """
+    Analyzes legal text for risks using Gemma 4.
+    Includes a retry mechanism for rate-limit stability.
+    """
+    prompt = f"""
+    You are a professional legal risk assessor. 
+    Analyze the following contract text for:
+    1. High-risk clauses (Liability, Termination, Payments).
+    2. Missing protections.
+    3. Potential financial gaps.
+
+    Provide a clear, structured summary of findings.
     
-    response = model.generate_content(prompt)
-    clean_json = response.text.replace('```json', '').replace('```', '').strip()
-    return json.loads(clean_json)
+    CONTRACT TEXT:
+    {text}
+    """
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            if "429" in str(e) and attempt < max_retries - 1:
+                # Wait 5 seconds before retrying if rate limited
+                time.sleep(5)
+                continue
+            return f"Analysis Error: {str(e)}"
+
+def extract_entities(text):
+    """
+    Helper function to get structured data for your dashboard's JSON view.
+    """
+    prompt = f"Extract the 'Effective Date', 'Parties Involved', and 'Contract Value' from this text as JSON: {text}"
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except:
+        return "{'error': 'Entity extraction failed'}"
